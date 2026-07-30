@@ -1,19 +1,41 @@
 import useSWR from 'swr';
-import { openmrsFetch, useSession } from '@openmrs/esm-framework';
+import { openmrsFetch, restBaseUrl, useSession } from '@openmrs/esm-framework';
 import { type StockDispenseRequest, type InventoryItem, type MedicationDispense } from '../../types';
 import { getUuidFromReference } from '../../utils';
 
 //TODO: Add configuration to retrieve the stock dispense endpoint
 // For stock dispense to work, stock management module should be installed and configured
+
 /**
  * Fetches the inventory items for a given drug UUID.
  *
  * @param {string} drugUuid - The UUID of the drug.
  * @returns {Array} - The inventory items.
  */
-export const useDispenseStock = (drugUuid: string) => {
+type DispenseStockIdentifier = string | { drugUuid?: string; stockItemUuid?: string };
+
+/**
+ * Fetches dispensable inventory (batches) for either a specific stock item
+ * (brand) or a drug.
+ *
+ * Accepts a plain string for backward compatibility with existing callers
+ * (treated as drugUuid, unchanged behavior). New callers that need to
+ * restrict to one brand — anything downstream of a bill, now that brand
+ * StockItems can share a drugUuid — should pass { stockItemUuid } instead:
+ * that filters to exactly that brand's batches rather than every brand
+ * sharing the drug.
+ */
+export const useDispenseStock = (identifier: DispenseStockIdentifier) => {
   const session = useSession();
-  const url = `/ws/rest/v1/stockmanagement/stockiteminventory?v=default&totalCount=true&drugUuid=${drugUuid}&includeBatchNo=true&groupBy=LocationStockItemBatchNo&dispenseLocationUuid=${session?.sessionLocation?.uuid}&includeStrength=1&includeConceptRefIds=1&emptyBatch=1&emptyBatchLocationUuid=${session?.sessionLocation?.uuid}&dispenseAtLocation=1`;
+  const { drugUuid, stockItemUuid } =
+    typeof identifier === 'string' ? { drugUuid: identifier, stockItemUuid: undefined } : identifier ?? {};
+
+  const itemParam = stockItemUuid ? `stockItemUuid=${stockItemUuid}` : drugUuid ? `drugUuid=${drugUuid}` : null;
+
+  const url = itemParam
+    ? `/ws/rest/v1/stockmanagement/stockiteminventory?v=default&totalCount=true&${itemParam}&includeBatchNo=true&groupBy=LocationStockItemBatchNo&dispenseLocationUuid=${session?.sessionLocation?.uuid}&includeStrength=1&includeConceptRefIds=1&emptyBatch=1&emptyBatchLocationUuid=${session?.sessionLocation?.uuid}&dispenseAtLocation=1`
+    : null;
+
   const { data, error, isLoading } = useSWR<{ data: { results: Array<InventoryItem> } }>(url, openmrsFetch);
   return { inventoryItems: data?.data?.results ?? [], error, isLoading };
 };
@@ -63,5 +85,39 @@ export const createStockDispenseRequestPayload = (
     stockBatch: inventoryItem.stockBatchUuid,
     stockItemPackagingUOM: inventoryItem.quantityUoMUuid,
     quantity: medicationDispensePayload.quantity.value,
+  };
+};
+
+/**
+ * Resolves which stock item (brand) was actually billed for a given
+ * order, by reading the cashier bill line item(s) linked to that order.
+ *
+ * Backed by BillLineItemResource.doSearch's `orderUuid` param, and
+ * BillLineItemResource.getItem(), which returns the item property as a
+ * string in the form "{stockItemUuid}:{displayName}".
+ */
+export const useBilledStockItemForOrder = (orderUuid: string) => {
+  const url = orderUuid ? `${restBaseUrl}/cashier/billLineItem?orderUuid=${orderUuid}&v=default` : null;
+  const { data, error, isLoading } = useSWR<{
+    data: { results: Array<{ item: string; uuid: string; voided?: boolean }> };
+  }>(url, openmrsFetch);
+
+  const results = (data?.data?.results ?? []).filter((li) => !li.voided);
+  const lineItem = results[results.length - 1];
+
+  let billedStockItemUuid: string | null = null;
+  let billedStockItemName: string | null = null;
+  if (lineItem?.item) {
+    const [stockItemUuid, ...rest] = lineItem.item.split(':');
+    billedStockItemUuid = stockItemUuid || null;
+    billedStockItemName = rest.join(':') || null;
+  }
+
+  return {
+    billedStockItemUuid,
+    billedStockItemName,
+    hasBill: results.length > 0,
+    isLoading,
+    error,
   };
 };

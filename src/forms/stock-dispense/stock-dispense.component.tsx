@@ -4,7 +4,8 @@ import { ComboBox, InlineLoading, InlineNotification, Layer } from '@carbon/reac
 import { formatDate, useConfig } from '@openmrs/esm-framework';
 import { type MedicationDispense, type InventoryItem } from '../../types';
 import { type PharmacyConfig } from '../../config-schema';
-import { useDispenseStock } from './stock.resource';
+import { useDispenseStock, useBilledStockItemForOrder } from './stock.resource';
+import { getUuidFromReference } from '../../utils';
 
 type StockDispenseProps = {
   medicationDispense: MedicationDispense;
@@ -16,8 +17,24 @@ const StockDispense: React.FC<StockDispenseProps> = ({ medicationDispense, updat
   const { t } = useTranslation();
   const config = useConfig<PharmacyConfig>();
 
-  const drugUuid = medicationDispense?.medicationReference?.reference?.split('/')[1];
-  const { inventoryItems, error, isLoading } = useDispenseStock(drugUuid);
+  const orderDrugUuid = medicationDispense?.medicationReference?.reference?.split('/')[1];
+  const orderUuid = getUuidFromReference(medicationDispense?.authorizingPrescription?.[0]?.reference);
+  const { billedStockItemUuid, isLoading: isLoadingBill } = useBilledStockItemForOrder(orderUuid ?? '');
+
+  /**
+   * Business rule: which batches are eligible for dispensing.
+   *
+   * - billedStockItemUuid resolved: this order was billed against a
+   *   specific brand — scope batches strictly to that stock item, never to
+   *   the shared drugUuid (which would surface sibling brands' batches).
+   * - billedStockItemUuid not resolved: no bill line item for this order,
+   *   so the drug is treated as non-billable — fall back to drugUuid,
+   *   unrestricted across brands (legacy behavior).
+   */
+  const dispenseIdentifier = billedStockItemUuid ? { stockItemUuid: billedStockItemUuid } : { drugUuid: orderDrugUuid };
+
+  const { inventoryItems, error, isLoading } = useDispenseStock(dispenseIdentifier);
+
   const validInventoryItems = inventoryItems
     .filter((item) => isValidBatch(medicationDispense, item))
     .sort((a, b) => new Date(a.expiration).getTime() - new Date(b.expiration).getTime());
@@ -89,6 +106,10 @@ const StockDispense: React.FC<StockDispenseProps> = ({ medicationDispense, updat
       },
     );
   };
+
+  if (isLoadingBill) {
+    return <InlineLoading description={t('resolvingBilledBrand', 'Resolving billed brand...')} />;
+  }
 
   if (error) {
     return (
